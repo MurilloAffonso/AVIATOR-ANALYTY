@@ -212,11 +212,19 @@ def main() -> None:
     )
     collector_mode = st.radio(
         "Modo de coleta",
-        options=["DOM", "WebSocket", "DOM + WebSocket"],
+        options=[
+            "DOM",
+            "WebSocket",
+            "DOM + WebSocket",
+            "WebSocket + Player Analytics",
+        ],
         index=0,
         help=(
             "DOM lê o histórico visível; WebSocket escuta frames recebidos "
-            "(menor latência); o modo híbrido roda os dois e deduplica."
+            "(menor latência); 'DOM + WebSocket' roda os dois e deduplica; "
+            "'WebSocket + Player Analytics' liga a bridge — frames são "
+            "enviados ao pipeline analítico em paralelo, sem afetar a "
+            "coleta de multiplicadores."
         ),
     )
 
@@ -225,13 +233,57 @@ def main() -> None:
             "Será aberto um navegador visível. Faça login manualmente se "
             "necessário. Nenhuma ação de aposta/cashout será executada."
         )
-        saved = _run_collectors(
-            mode=collector_mode,
-            url=aviator_url,
-            poll_seconds=float(poll_seconds),
-            max_runtime=int(max_runtime),
+        if collector_mode == "WebSocket + Player Analytics":
+            from app.player_analytics.runner import run_sync as run_with_analytics_sync
+
+            result = run_with_analytics_sync(
+                url=aviator_url,
+                poll_seconds=float(poll_seconds),
+                max_runtime=int(max_runtime),
+            )
+            st.success(
+                f"Coleta finalizada. Multiplicadores salvos: "
+                f"{result.multipliers_saved}. Snapshots de rodada: "
+                f"{result.bridge_metrics.snapshots_generated}."
+            )
+            with st.expander("Métricas da bridge"):
+                st.json(result.bridge_metrics.as_dict())
+        else:
+            saved = _run_collectors(
+                mode=collector_mode,
+                url=aviator_url,
+                poll_seconds=float(poll_seconds),
+                max_runtime=int(max_runtime),
+            )
+            st.success(f"Coleta finalizada. Novos multiplicadores salvos: {saved}")
+
+    # ---- Replay offline ----
+    with st.expander("Replay de sessão WebSocket gravada"):
+        st.caption(
+            "Carregue um arquivo `.jsonl` (uma linha JSON por frame "
+            "recebido) para reprocessar uma sessão sem abrir o navegador. "
+            "Útil para validar mudanças de mapeamento de campos contra "
+            "dados reais."
         )
-        st.success(f"Coleta finalizada. Novos multiplicadores salvos: {saved}")
+        replay_file = st.file_uploader(
+            "Arquivo .jsonl", type=["jsonl", "json", "txt"]
+        )
+        replay_persist = st.checkbox(
+            "Persistir snapshots no banco", value=False,
+            help="Desligue para apenas ver as métricas sem alterar o histórico.",
+        )
+        if replay_file is not None and st.button("Executar replay"):
+            from app.player_analytics.runner import replay_sync
+
+            raw = replay_file.getvalue().decode("utf-8", errors="ignore")
+            payloads = [line for line in raw.splitlines() if line.strip()]
+            metrics = replay_sync(payloads, persist=replay_persist)
+            st.success(
+                f"Replay concluído. Snapshots: "
+                f"{metrics.snapshots_generated}. Eventos parseados: "
+                f"{metrics.events_parsed}."
+            )
+            st.json(metrics.as_dict())
 
     history = load_history()
     st.subheader("Histórico")

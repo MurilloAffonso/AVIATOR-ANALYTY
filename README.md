@@ -169,6 +169,8 @@ app/player_analytics/
   psychology.py        # distribuição emocional + exit heatmap
   whales.py            # outliers de stake (P95/P99), sem PII
   ws_adapter.py        # frames WS -> RoundEvent/PlayerEvent (heurístico, configurável)
+  bridge.py            # PlayerAnalyticsBridge (frames WS -> pipeline em runtime)
+  runner.py            # orquestra coletor + bridge + persistência (sync wrappers)
   storage.py           # persistência de RoundSnapshot no SQLite
   models.py            # ORM: RoundSnapshotORM
   ui.py                # render Streamlit
@@ -199,17 +201,75 @@ app/player_analytics/
 |---|---|---|
 | `AVIATOR_PA_FIELD_MAP` | (vazio) | Mapeia campos JSON do cassino para nossos canônicos. Formato CSV: `round_id=gameId,player_id=accountHash,stake=wagerCents`. As chaves canônicas são `round_id`, `player_id`, `stake`, `cashout`, `payout`, `crash`, `event_type`. |
 
-### Status atual da integração
+### PlayerAnalyticsBridge (runtime)
 
-O `WebSocketCollector` ainda emite apenas multiplicadores de crash. Para o Player Analytics ser populado em runtime real, há um TODO arquitetural: rotear cada frame WS através de `ws_adapter.parse_ws_frame_for_events` para emitir `RoundEvent`/`PlayerEvent` no `PlayerEventPipeline`. Esse passo não é feito automaticamente porque depende do cassino expor esses campos — preferimos não emitir dados degenerados. Quando a integração for ligada, basta plugar o adapter no callback `framereceived`.
+`bridge.py` conecta o `WebSocketCollector` ao `PlayerEventPipeline` em tempo real:
 
-Enquanto isso, o painel exibe uma mensagem explicativa quando ainda não há snapshots.
+```
+ws.framereceived (Playwright, callback síncrono)
+        │
+        ▼
+bridge.on_frame(payload, "rx")          ← listener registrado
+        │   parse_ws_frame_for_events(payload)
+        ▼
+asyncio.Queue (bounded, drop-oldest)    ← fila dedicada à analytics
+        │
+        ▼
+consumer task                           ← isolado de exceções, conta restarts
+        │
+        ▼
+PlayerEventPipeline → on_snapshot       ← persiste RoundSnapshot
+```
+
+**Garantias da bridge:**
+
+- **Não bloqueia o coletor.** O listener síncrono só faz parse + enqueue (`call_soon_threadsafe`). O caminho de extração de multiplicadores do `WebSocketCollector` permanece intocado — testado em `test_listener_failure_does_not_break_collector`.
+- **Back-pressure por drop-oldest.** Quando a fila enche, descarta o item mais antigo e incrementa `dropped_oldest`. Preserva a ponta recente, que é onde costuma estar o crash da rodada.
+- **Tolerante a falhas.** Parser que `raise`, callback do usuário que crasha, `pipeline.handle` que falha — todos contidos. Métricas registram `parse_failures`, `consumer_restarts`, `last_error`. O consumer continua vivo.
+- **Ciclo de vida idempotente.** `start()` e `stop()` podem ser chamados múltiplas vezes.
+- **Replay.** `bridge.replay(payloads)` ou `runner.replay_session(payloads, persist=False)` re-executam uma sessão gravada offline — útil para validar mudanças de mapeamento sem abrir browser.
+
+**Métricas expostas em `bridge.metrics.as_dict()`:**
+
+| Campo | Tipo | Significado |
+|---|---|---|
+| `frames_received` | int | total de frames vistos (incl. tx ignorados) |
+| `events_parsed` | int | eventos válidos extraídos |
+| `parse_failures` | int | exceções no parser (≠ frames sem dado, que retornam `[]`) |
+| `enqueue_failures` | int | frames perdidos mesmo após drop-oldest |
+| `dropped_oldest` | int | itens descartados por fila cheia |
+| `analytics_queue_size` | int | snapshot do tamanho atual da fila |
+| `snapshots_generated` | int | rodadas finalizadas e enviadas ao callback |
+| `consumer_restarts` | int | exceções não-fatais no consumer |
+| `last_error` | str? | repr da última exceção registrada |
+
+**Como ligar na UI:** o modo "WebSocket + Player Analytics" no botão de coleta sobe a bridge automaticamente. Ao final, mostra as métricas no expander. O mesmo painel oferece replay de arquivo `.jsonl`.
+
+**Como ligar em código:**
+
+```python
+from app.player_analytics.bridge import PlayerAnalyticsBridge
+from app.player_analytics.storage import persist_snapshot
+from app.collector.ws_collector import WebSocketCollector
+
+bridge = PlayerAnalyticsBridge(on_snapshot=persist_snapshot)
+await bridge.start()
+
+ws = WebSocketCollector(url="https://...")
+ws.add_frame_listener(bridge.on_frame)
+
+# ... rodar coleta normalmente ...
+
+await bridge.stop(drain=True)
+print(bridge.metrics.as_dict())
+```
 
 ## Cobertura de testes
 
 | Módulo | Testes | Notas |
 |---|---|---|
 | `app/collector/parser.py` | 21 | Texto, JSON aninhado, frames WS, env var customizada |
+| `app/player_analytics/bridge.py` | 20 | Lifecycle, back-pressure, replay, integração WS, métricas |
 | `app/analyzer.py` | 18 | Boundaries, summarize, scores |
 | `app/player_analytics/crowd_behavior.py` | 14 | Greed, panic, aggression, exit rates |
 | `app/player_analytics/pipeline.py` | 13 | Eventos -> snapshots, dedup, fora-de-ordem, callbacks |
@@ -222,12 +282,13 @@ Enquanto isso, o painel exibe uma mensagem explicativa quando ainda não há sna
 | `app/player_analytics/whales.py` | 7 | P95/P99, share, trend |
 | `app/player_analytics/psychology.py` | 7 | Distribuição emocional, heatmap |
 | `app/player_analytics/storage.py` | 5 | Persistência idempotente, ordem desc, valores nulos |
+| `app/player_analytics/runner.py` | 5 | Replay session sync/async, persist on/off |
 | `app/volatility.py` | 5 | NaN inicial, série constante |
 | `app/collector/manual.py` | 3 | Validação, persistência |
 | `app/collector/dom_collector.py` | 0 (auditoria estática) | Depende de Playwright |
 | `app/collector/ws_collector.py` | 0 (auditoria estática) | Depende de Playwright |
 | `app/main.py`, `app/player_analytics/ui.py` | 0 | UI Streamlit, teste via execução manual |
 
-Total: **151 passed**.
+Total: **176 passed**.
 
 UI/Coletores ficam sem teste de unidade *funcional* porque dependem de I/O externo (navegador real, servidor Streamlit, cassino com WS ativo). A lógica determinística — extração, dedup, agendamento via fila, agregação de eventos, métricas — está coberta isoladamente.

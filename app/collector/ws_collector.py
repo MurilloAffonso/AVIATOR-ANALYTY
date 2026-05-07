@@ -14,16 +14,28 @@ Garantias:
 - Zero ações de UI (clique, digitação, navegação para botões de aposta).
 - Zero envio de frames WS.
 - Apenas extração estatística do payload bruto via ``parser``.
+
+Pontos de extensão:
+- ``add_frame_listener(callback)`` — outros componentes (ex.:
+  ``PlayerAnalyticsBridge``) podem se inscrever para receber o payload
+  bruto sem afetar o caminho principal de extração de multiplicadores.
+  Listeners executam em try/except isolado: se um falhar, os outros
+  e o próprio coletor seguem normais.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Optional
 
 from app.collector.base import BaseCollector, CollectorEvent
 from app.collector.parser import extract_from_ws_frame
+
+
+# Tipo do listener externo: recebe (payload_bruto, direction)
+FrameListener = Callable[[object, str], None]
 
 
 class WebSocketCollector(BaseCollector):
@@ -54,6 +66,27 @@ class WebSocketCollector(BaseCollector):
         self.flush_interval_seconds = flush_interval_seconds
         self._buffer: list[float] = []
         self._buffer_lock = asyncio.Lock()
+        # Listeners externos para o payload bruto. Cada um é chamado em
+        # try/except isolado em ``_on_frame``. Não afeta a extração de
+        # multiplicadores — esse caminho permanece intocado.
+        self._frame_listeners: list[FrameListener] = []
+
+    def add_frame_listener(self, listener: FrameListener) -> None:
+        """Registra um observador externo do payload bruto.
+
+        O listener recebe ``(payload, direction)`` onde ``direction`` é
+        ``"rx"`` (recebido) ou ``"tx"`` (enviado pela página, nunca por nós).
+        Listeners não devem bloquear nem levantar exceções; ainda assim,
+        falhas são contidas em try/except.
+        """
+        self._frame_listeners.append(listener)
+
+    def remove_frame_listener(self, listener: FrameListener) -> None:
+        """Remove um listener previamente registrado, se existir."""
+        try:
+            self._frame_listeners.remove(listener)
+        except ValueError:
+            pass
 
     async def run_async(self, queue: "asyncio.Queue[CollectorEvent]") -> None:
         try:
@@ -133,6 +166,19 @@ class WebSocketCollector(BaseCollector):
         ws.on("close", lambda *_: self._logger.info("WebSocket fechado: %s", url))
 
     def _on_frame(self, payload, direction: str) -> None:
+        # 1. Notifica listeners externos primeiro, com isolamento de
+        #    falhas. Cada listener vê o payload bruto. Falhas em
+        #    listeners NUNCA afetam o pipeline interno de multiplicadores.
+        if self._frame_listeners:
+            for listener in tuple(self._frame_listeners):
+                try:
+                    listener(payload, direction)
+                except Exception as exc:  # noqa: BLE001
+                    self._logger.warning(
+                        "frame listener falhou (isolado): %s", exc
+                    )
+
+        # 2. Caminho principal: extrair multiplicadores (caminho antigo).
         try:
             values = extract_from_ws_frame(payload)
         except Exception as exc:  # noqa: BLE001
