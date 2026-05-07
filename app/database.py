@@ -9,6 +9,7 @@ Base = declarative_base()
 
 
 def init_db() -> None:
-    from app.models import RoundResult
+    from app.models import RoundResult  # noqa: F401
+    from app.player_analytics.models import RoundSnapshotORM  # noqa: F401
 
     Base.metadata.create_all(bind=engine)

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from app.analyzer import analyze_advanced, summarize
-from app.collector.browser import collect_live_results
+from app.collector.browser import collect_live_results  # wrapper retrocompat
+from app.collector.dom_collector import DOMCollector
+from app.collector.manager import CollectorManager
 from app.collector.manual import save_manual_multiplier
+from app.collector.ws_collector import WebSocketCollector
 from app.backtesting import BacktestConfig, run_all_strategies
 from app.database import SessionLocal, init_db
 from app.models import RoundResult
+from app.player_analytics.storage import load_all_snapshots
+from app.player_analytics.ui import render_player_analytics
 
 
 def load_history() -> pd.DataFrame:
@@ -140,6 +147,42 @@ def render_backtesting(df: pd.DataFrame) -> None:
     fig.update_layout(title=f"Evolução da banca - {selected_result.strategy_name}", xaxis_title="Entradas", yaxis_title="Banca")
     st.plotly_chart(fig, use_container_width=True)
 
+def _run_collectors(
+    mode: str,
+    url: str,
+    poll_seconds: float,
+    max_runtime: int,
+) -> int:
+    """Despacha para a arquitetura nova de coletores conforme o modo escolhido.
+
+    Modo "DOM" preserva o caminho antigo via wrapper síncrono. Os outros
+    instanciam o ``CollectorManager`` diretamente.
+    """
+    if mode == "DOM":
+        return collect_live_results(
+            url=url,
+            poll_interval_seconds=poll_seconds,
+            max_runtime_seconds=max_runtime,
+        )
+
+    collectors: list = []
+    if mode in ("WebSocket", "DOM + WebSocket"):
+        collectors.append(
+            WebSocketCollector(url=url, max_runtime_seconds=max_runtime)
+        )
+    if mode == "DOM + WebSocket":
+        collectors.append(
+            DOMCollector(
+                url=url,
+                poll_interval_seconds=poll_seconds,
+                max_runtime_seconds=max_runtime,
+            )
+        )
+
+    manager = CollectorManager(collectors)
+    return asyncio.run(manager.run())
+
+
 def main() -> None:
     st.set_page_config(page_title="Aviator Pattern Analyzer", layout="wide")
     st.title("Aviator Pattern Analyzer")
@@ -158,23 +201,89 @@ def main() -> None:
             st.success(f"Multiplicador {value:.2f}x salvo com sucesso.")
 
     st.subheader("Coleta ao vivo (somente leitura)")
+    st.caption(
+        "Esta seção apenas observa multiplicadores visíveis na página ou "
+        "frames WebSocket recebidos. Nenhum clique, aposta ou cashout é executado."
+    )
     aviator_url = st.text_input("URL do Aviator", value="https://example.com/aviator")
     poll_seconds = st.number_input("Intervalo de leitura (segundos)", min_value=1.0, value=2.0, step=0.5)
     max_runtime = st.number_input(
         "Tempo máximo da coleta (segundos, 0 = sem limite)", min_value=0, value=0, step=10
     )
+    collector_mode = st.radio(
+        "Modo de coleta",
+        options=[
+            "DOM",
+            "WebSocket",
+            "DOM + WebSocket",
+            "WebSocket + Player Analytics",
+        ],
+        index=0,
+        help=(
+            "DOM lê o histórico visível; WebSocket escuta frames recebidos "
+            "(menor latência); 'DOM + WebSocket' roda os dois e deduplica; "
+            "'WebSocket + Player Analytics' liga a bridge — frames são "
+            "enviados ao pipeline analítico em paralelo, sem afetar a "
+            "coleta de multiplicadores."
+        ),
+    )
 
     if st.button("Iniciar coleta ao vivo"):
         st.info(
-            "Será aberto um navegador visível para leitura. Faça login manualmente se necessário. "
-            "Nenhuma ação de aposta/cashout será executada."
+            "Será aberto um navegador visível. Faça login manualmente se "
+            "necessário. Nenhuma ação de aposta/cashout será executada."
         )
-        saved = collect_live_results(
-            url=aviator_url,
-            poll_interval_seconds=float(poll_seconds),
-            max_runtime_seconds=int(max_runtime),
+        if collector_mode == "WebSocket + Player Analytics":
+            from app.player_analytics.runner import run_sync as run_with_analytics_sync
+
+            result = run_with_analytics_sync(
+                url=aviator_url,
+                poll_seconds=float(poll_seconds),
+                max_runtime=int(max_runtime),
+            )
+            st.success(
+                f"Coleta finalizada. Multiplicadores salvos: "
+                f"{result.multipliers_saved}. Snapshots de rodada: "
+                f"{result.bridge_metrics.snapshots_generated}."
+            )
+            with st.expander("Métricas da bridge"):
+                st.json(result.bridge_metrics.as_dict())
+        else:
+            saved = _run_collectors(
+                mode=collector_mode,
+                url=aviator_url,
+                poll_seconds=float(poll_seconds),
+                max_runtime=int(max_runtime),
+            )
+            st.success(f"Coleta finalizada. Novos multiplicadores salvos: {saved}")
+
+    # ---- Replay offline ----
+    with st.expander("Replay de sessão WebSocket gravada"):
+        st.caption(
+            "Carregue um arquivo `.jsonl` (uma linha JSON por frame "
+            "recebido) para reprocessar uma sessão sem abrir o navegador. "
+            "Útil para validar mudanças de mapeamento de campos contra "
+            "dados reais."
         )
-        st.success(f"Coleta finalizada. Novos multiplicadores salvos: {saved}")
+        replay_file = st.file_uploader(
+            "Arquivo .jsonl", type=["jsonl", "json", "txt"]
+        )
+        replay_persist = st.checkbox(
+            "Persistir snapshots no banco", value=False,
+            help="Desligue para apenas ver as métricas sem alterar o histórico.",
+        )
+        if replay_file is not None and st.button("Executar replay"):
+            from app.player_analytics.runner import replay_sync
+
+            raw = replay_file.getvalue().decode("utf-8", errors="ignore")
+            payloads = [line for line in raw.splitlines() if line.strip()]
+            metrics = replay_sync(payloads, persist=replay_persist)
+            st.success(
+                f"Replay concluído. Snapshots: "
+                f"{metrics.snapshots_generated}. Eventos parseados: "
+                f"{metrics.events_parsed}."
+            )
+            st.json(metrics.as_dict())
 
     history = load_history()
     st.subheader("Histórico")
@@ -184,6 +293,13 @@ def main() -> None:
     render_advanced_analysis(history)
     render_charts(history)
     render_backtesting(history)
+
+    # Player Analytics Engine: depende de snapshots persistidos pelo
+    # pipeline de eventos (alimentado por DOM/WS quando o cassino expõe
+    # campos de jogador). Se ainda não há snapshots, a seção aparece
+    # com uma mensagem explicativa em vez de quebrar.
+    snapshots = load_all_snapshots()
+    render_player_analytics(snapshots)
 
 
 if __name__ == "__main__":
