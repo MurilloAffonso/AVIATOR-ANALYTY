@@ -35,7 +35,17 @@ app/
     dedup.py            # deduplicação por sequência (corrige bug de baixos repetidos)
     manual.py           # inserção manual via UI
     browser.py          # wrapper retrocompat: collect_live_results(url, ...)
-tests/                  # 77 testes
+  player_analytics/      # Player Analytics Engine (agregados anônimos)
+    events.py            # RoundEvent, PlayerEvent, RoundSnapshot
+    pipeline.py          # eventos -> snapshot por rodada
+    survival.py          # curva de sobrevivência
+    crowd_behavior.py    # greed, panic, aggression
+    liquidity.py         # exhaustion, player flow
+    psychology.py        # emoção + heatmap
+    whales.py            # outliers de stake
+    ws_adapter.py        # frames WS -> eventos de domínio
+    storage.py / models.py / ui.py
+tests/                  # 151 testes
 data/                   # SQLite local (criado em runtime)
 ```
 
@@ -145,21 +155,79 @@ Saídas exibidas:
 - ROI;
 - gráfico da evolução da banca por estratégia.
 
+## Player Analytics Engine
+
+Painel agregado e anônimo do comportamento coletivo dos jogadores. Vive em `app/player_analytics/`:
+
+```text
+app/player_analytics/
+  events.py            # RoundEvent, PlayerEvent, RoundSnapshot
+  pipeline.py          # consome eventos, fecha rodada em ROUND_CRASH, emite snapshot
+  survival.py          # curva de sobrevivência (Kaplan-Meier adaptado, censura no crash)
+  crowd_behavior.py    # greed index, panic exit, crowd aggression, exit rates
+  liquidity.py         # liquidity exhaustion, player flow, trend
+  psychology.py        # distribuição emocional + exit heatmap
+  whales.py            # outliers de stake (P95/P99), sem PII
+  ws_adapter.py        # frames WS -> RoundEvent/PlayerEvent (heurístico, configurável)
+  storage.py           # persistência de RoundSnapshot no SQLite
+  models.py            # ORM: RoundSnapshotORM
+  ui.py                # render Streamlit
+```
+
+### Princípios
+
+1. **Somente leitura** — nenhuma ação financeira; os módulos consomem eventos já capturados pelos coletores.
+2. **Anonimato por construção** — IDs de jogador são hashados (SHA-256, truncado a 16 chars) **apenas** para deduplicar dentro de uma rodada. Os hashes são descartados ao fechar o snapshot. Nada de PII é persistido.
+3. **Apenas agregados** — o que entra no SQLite é o `RoundSnapshot`: contagens, listas de cashouts, listas de stakes. Nunca "qual jogador apostou quanto".
+4. **Degrada graciosamente** — se o cassino não expõe `stake`, métricas de liquidez/whales devolvem `None`/zero; não inventam.
+
+### O que cada módulo computa
+
+- **survival**: `S(m)` = fração de jogadores ainda expostos ao risco no multiplicador `m`. Quem foi pego pelo crash é tratado como censurado em `crash_multiplier`.
+- **crowd_behavior**:
+  - *greed_index* (0–100) — interpolação por mediana dos cashouts;
+  - *panic_exit_score* (0–100) — concentração de cashouts numa janela apertada e em multiplicador baixo (heurística de "todos correram pra saída");
+  - *crowd_aggression* (0–100) — combinação de ganância + participação;
+  - *early_exit_rate*, *late_exit_rate*.
+- **liquidity**: `payout_ratio = paid_out / staked`; *liquidity_exhaustion* (0–100, clamp); *player_flow* entre rodadas consecutivas; trend nas últimas N rodadas.
+- **psychology**: bins emocionais (`medo`, `cautela`, `equilibrio`, `ambicao`, `euforia`, `queimou`) e *exit heatmap* unidimensional sobre todas as rodadas.
+- **whales**: detecção via P95/P99 com fator multiplicativo sobre a mediana. Mínimo de 10 jogadores. Devolve contagem, share de volume e maior stake — sem identidade.
+
+### Variáveis de ambiente adicionais
+
+| Variável | Default | Efeito |
+|---|---|---|
+| `AVIATOR_PA_FIELD_MAP` | (vazio) | Mapeia campos JSON do cassino para nossos canônicos. Formato CSV: `round_id=gameId,player_id=accountHash,stake=wagerCents`. As chaves canônicas são `round_id`, `player_id`, `stake`, `cashout`, `payout`, `crash`, `event_type`. |
+
+### Status atual da integração
+
+O `WebSocketCollector` ainda emite apenas multiplicadores de crash. Para o Player Analytics ser populado em runtime real, há um TODO arquitetural: rotear cada frame WS através de `ws_adapter.parse_ws_frame_for_events` para emitir `RoundEvent`/`PlayerEvent` no `PlayerEventPipeline`. Esse passo não é feito automaticamente porque depende do cassino expor esses campos — preferimos não emitir dados degenerados. Quando a integração for ligada, basta plugar o adapter no callback `framereceived`.
+
+Enquanto isso, o painel exibe uma mensagem explicativa quando ainda não há snapshots.
+
 ## Cobertura de testes
 
 | Módulo | Testes | Notas |
 |---|---|---|
 | `app/collector/parser.py` | 21 | Texto, JSON aninhado, frames WS, env var customizada |
 | `app/analyzer.py` | 18 | Boundaries, summarize, scores |
+| `app/player_analytics/crowd_behavior.py` | 14 | Greed, panic, aggression, exit rates |
+| `app/player_analytics/pipeline.py` | 13 | Eventos -> snapshots, dedup, fora-de-ordem, callbacks |
 | `app/collector/dedup.py` | 12 | Inclui regressão do bug de baixos repetidos |
+| `app/player_analytics/ws_adapter.py` | 12 | Heurísticas, mapeamento de campos, anonimização |
+| `app/player_analytics/liquidity.py` | 9 | Exhaustion, player flow, trend |
 | `app/backtesting.py` | 9 | Stop-loss, stop-gain, max_entries, all-strategies |
-| `app/collector/`  (base + manager + auditoria) | 9 | Fakes + testes de auditoria estática contra ações financeiras |
-| `app/volatility.py` | 5 | NaN inicial, série constante, janela default |
-| `app/collector/manual.py` | 3 | Validação, persistência, valores repetidos |
-| `app/collector/dom_collector.py` | 0 (auditoria estática) | Depende de Playwright + página real |
-| `app/collector/ws_collector.py` | 0 (auditoria estática) | Depende de Playwright + página real |
-| `app/main.py` | 0 | UI Streamlit, testar via execução manual |
+| `app/collector/{base,manager}` | 9 | Fakes + auditoria estática anti-ação-financeira |
+| `app/player_analytics/survival.py` | 7 | Curva por rodada, agregada, censura |
+| `app/player_analytics/whales.py` | 7 | P95/P99, share, trend |
+| `app/player_analytics/psychology.py` | 7 | Distribuição emocional, heatmap |
+| `app/player_analytics/storage.py` | 5 | Persistência idempotente, ordem desc, valores nulos |
+| `app/volatility.py` | 5 | NaN inicial, série constante |
+| `app/collector/manual.py` | 3 | Validação, persistência |
+| `app/collector/dom_collector.py` | 0 (auditoria estática) | Depende de Playwright |
+| `app/collector/ws_collector.py` | 0 (auditoria estática) | Depende de Playwright |
+| `app/main.py`, `app/player_analytics/ui.py` | 0 | UI Streamlit, teste via execução manual |
 
-Total: **77 passed**.
+Total: **151 passed**.
 
-DOM/WS/UI ficam sem teste de unidade *funcional* porque dependem de I/O externo (navegador real, servidor Streamlit, cassino com WS ativo). A lógica determinística — extração, dedup, agendamento via fila, persistência — está coberta isoladamente.
+UI/Coletores ficam sem teste de unidade *funcional* porque dependem de I/O externo (navegador real, servidor Streamlit, cassino com WS ativo). A lógica determinística — extração, dedup, agendamento via fila, agregação de eventos, métricas — está coberta isoladamente.

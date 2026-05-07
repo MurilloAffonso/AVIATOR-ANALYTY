@@ -16,6 +16,8 @@ from app.collector.ws_collector import WebSocketCollector
 from app.backtesting import BacktestConfig, run_all_strategies
 from app.database import SessionLocal, init_db
 from app.models import RoundResult
+from app.player_analytics.storage import load_all_snapshots
+from app.player_analytics.ui import render_player_analytics
 
 
 def load_history() -> pd.DataFrame:
@@ -239,6 +241,13 @@ def main() -> None:
     render_advanced_analysis(history)
     render_charts(history)
     render_backtesting(history)
+
+    # Player Analytics Engine: depende de snapshots persistidos pelo
+    # pipeline de eventos (alimentado por DOM/WS quando o cassino expõe
+    # campos de jogador). Se ainda não há snapshots, a seção aparece
+    # com uma mensagem explicativa em vez de quebrar.
+    snapshots = load_all_snapshots()
+    render_player_analytics(snapshots)
 
 
 if __name__ == "__main__":
