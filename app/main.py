@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from app.analyzer import analyze_advanced, summarize
-from app.collector.browser import collect_live_results
+from app.collector.browser import collect_live_results  # wrapper retrocompat
+from app.collector.dom_collector import DOMCollector
+from app.collector.manager import CollectorManager
 from app.collector.manual import save_manual_multiplier
+from app.collector.ws_collector import WebSocketCollector
 from app.backtesting import BacktestConfig, run_all_strategies
 from app.database import SessionLocal, init_db
 from app.models import RoundResult
@@ -140,6 +145,42 @@ def render_backtesting(df: pd.DataFrame) -> None:
     fig.update_layout(title=f"Evolução da banca - {selected_result.strategy_name}", xaxis_title="Entradas", yaxis_title="Banca")
     st.plotly_chart(fig, use_container_width=True)
 
+def _run_collectors(
+    mode: str,
+    url: str,
+    poll_seconds: float,
+    max_runtime: int,
+) -> int:
+    """Despacha para a arquitetura nova de coletores conforme o modo escolhido.
+
+    Modo "DOM" preserva o caminho antigo via wrapper síncrono. Os outros
+    instanciam o ``CollectorManager`` diretamente.
+    """
+    if mode == "DOM":
+        return collect_live_results(
+            url=url,
+            poll_interval_seconds=poll_seconds,
+            max_runtime_seconds=max_runtime,
+        )
+
+    collectors: list = []
+    if mode in ("WebSocket", "DOM + WebSocket"):
+        collectors.append(
+            WebSocketCollector(url=url, max_runtime_seconds=max_runtime)
+        )
+    if mode == "DOM + WebSocket":
+        collectors.append(
+            DOMCollector(
+                url=url,
+                poll_interval_seconds=poll_seconds,
+                max_runtime_seconds=max_runtime,
+            )
+        )
+
+    manager = CollectorManager(collectors)
+    return asyncio.run(manager.run())
+
+
 def main() -> None:
     st.set_page_config(page_title="Aviator Pattern Analyzer", layout="wide")
     st.title("Aviator Pattern Analyzer")
@@ -158,21 +199,35 @@ def main() -> None:
             st.success(f"Multiplicador {value:.2f}x salvo com sucesso.")
 
     st.subheader("Coleta ao vivo (somente leitura)")
+    st.caption(
+        "Esta seção apenas observa multiplicadores visíveis na página ou "
+        "frames WebSocket recebidos. Nenhum clique, aposta ou cashout é executado."
+    )
     aviator_url = st.text_input("URL do Aviator", value="https://example.com/aviator")
     poll_seconds = st.number_input("Intervalo de leitura (segundos)", min_value=1.0, value=2.0, step=0.5)
     max_runtime = st.number_input(
         "Tempo máximo da coleta (segundos, 0 = sem limite)", min_value=0, value=0, step=10
     )
+    collector_mode = st.radio(
+        "Modo de coleta",
+        options=["DOM", "WebSocket", "DOM + WebSocket"],
+        index=0,
+        help=(
+            "DOM lê o histórico visível; WebSocket escuta frames recebidos "
+            "(menor latência); o modo híbrido roda os dois e deduplica."
+        ),
+    )
 
     if st.button("Iniciar coleta ao vivo"):
         st.info(
-            "Será aberto um navegador visível para leitura. Faça login manualmente se necessário. "
-            "Nenhuma ação de aposta/cashout será executada."
+            "Será aberto um navegador visível. Faça login manualmente se "
+            "necessário. Nenhuma ação de aposta/cashout será executada."
         )
-        saved = collect_live_results(
+        saved = _run_collectors(
+            mode=collector_mode,
             url=aviator_url,
-            poll_interval_seconds=float(poll_seconds),
-            max_runtime_seconds=int(max_runtime),
+            poll_seconds=float(poll_seconds),
+            max_runtime=int(max_runtime),
         )
         st.success(f"Coleta finalizada. Novos multiplicadores salvos: {saved}")
 

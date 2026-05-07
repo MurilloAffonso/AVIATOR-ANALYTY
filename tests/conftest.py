@@ -33,8 +33,10 @@ def in_memory_db(monkeypatch):
     # então também precisamos sobrescrever lá.
     from app.collector import browser as browser_mod
     from app.collector import manual as manual_mod
+    from app.collector import manager as manager_mod
 
     monkeypatch.setattr(browser_mod, "SessionLocal", TestSession)
     monkeypatch.setattr(manual_mod, "SessionLocal", TestSession)
+    monkeypatch.setattr(manager_mod, "SessionLocal", TestSession)
 
     yield TestSession
